@@ -1,4 +1,4 @@
 @echo off
-rem DS娘桌宠 启动器（v2：不用 -WindowStyle Hidden，脚本内自隐藏控制台）
+rem DS Maid Pet launcher (ASCII only: cmd reads .bat as ANSI, so no CJK in this file)
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0pet.ps1"
 exit
