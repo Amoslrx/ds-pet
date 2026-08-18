@@ -277,7 +277,7 @@ function Render {
       $g = [System.Drawing.Graphics]::FromImage($script:canvas)
       $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
       $g.Clear($script:Magenta)
-      $bob = [Math]::Sin($script:bobPhase) * 5.0
+      $bob = 0.0
       $g.TranslateTransform([float]$cx, [float]($cy + $bob))
       $g.RotateTransform([float]$script:rot)
       $g.DrawImage($script:scaledImg, [float](-$sw / 2.0), [float](-$sh), [float]$sw, [float]$sh)
@@ -491,15 +491,16 @@ $form.Add_KeyUp({
   } catch { Log-Err ('KeyUp: ' + $_.Exception.Message) }
 })
 
-# ---------- 定时器 ----------
+# ---------- 定时器（只做轻量逻辑，不重绘；仅在状态变化时重绘） ----------
 $timer = New-Object System.Windows.Forms.Timer
-$timer.Interval = 80
+$timer.Interval = 200
 $timer.Add_Tick({
   try {
+    $changed = $false
     $now = [Environment]::TickCount
-    $script:bobPhase += 0.14
     if ($script:phrase -and $now -gt $script:phraseHideAt) {
       $script:phrase = $null
+      $changed = $true
     }
     if ($script:balHandle) {
       if ($script:balHandle.IsCompleted) {
@@ -512,10 +513,13 @@ $timer.Add_Tick({
         $script:balPS.Dispose()
         $script:balPS = $null
         $script:balHandle = $null
+        $changed = $true
       }
     }
-    Render
-    Apply
+    if ($changed) {
+      Render
+      Apply
+    }
   } catch { Log-Err ('Timer: ' + $_.Exception.Message) }
 })
 $timer.Start()
