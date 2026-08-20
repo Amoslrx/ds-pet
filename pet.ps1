@@ -1,19 +1,16 @@
 ﻿#Requires -Version 5.1
 # ============================================================
-# DS娘桌宠 v2 · 原生桌面宠物 (DS Maid Desktop Pet)
+# DS娘桌宠 v6 · 原生桌面宠物 (DS Maid Desktop Pet)
 # ------------------------------------------------------------
 # 双击「启动桌宠.bat」运行。
 # 操作：
-#   左键拖动   -> 移动位置
-#   右键拖动   -> 旋转（绕脚底中心）
-#   滚轮       -> 放大 / 缩小
-#   单击(左键) -> 随机说一句可爱的话
-#   双击       -> 恢复初始大小与角度
-#   按住 F8    -> 显示 DeepSeek 余额（先点击桌宠获得焦点）
-#   右下角「-」 -> 最小化（只剩 + 和 -）
-#   最小化时「+」-> 恢复显示；「-」-> 退出桌宠
-# v2 修复：更小默认尺寸、流畅渲染（复用画布+Invalidate）、
-#          单实例保护、异常隔离防崩溃、图片去光晕。
+#   左键拖动   -> 移动位置；单击 -> 随机说可爱的话
+#   滚轮       -> 放大 / 缩小（先点一下桌宠获得焦点）
+#   双击       -> 恢复初始大小
+#   右键单击   -> 关闭桌宠
+#   全局按 F8  -> 显示 DeepSeek 余额（松开隐藏）
+# v6 变更：改为 OnPaint 直接绘制帧（彻底解决闪烁）；去掉 +/- 最小化/退出按钮；
+#          右键关闭桌宠。
 # ============================================================
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -23,9 +20,11 @@ $script:AppDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:ImgPath = Join-Path $script:AppDir 'ds-cutout.png'
 $script:ErrLog  = Join-Path $script:AppDir '.pet-errors.log'
 
-# ---- 单实例保护 ----
-$script:Mutex = New-Object System.Threading.Mutex($false, 'DSMaidPetMutex')
-if (-not $script:Mutex.WaitOne(0)) { exit 0 }
+function Log-Err {
+  param($m)
+  try { Add-Content -Path $script:ErrLog -Value ((Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '  ' + $m) -Encoding UTF8 } catch {}
+}
+Log-Err '=== pet.ps1 v6 启动 ==='
 
 # ---- 隐藏自己的控制台窗口（不影响桌宠窗体） ----
 try {
@@ -39,16 +38,78 @@ public class ConHider {
 '@
   $ch = [ConHider]::GetConsoleWindow()
   if ($ch -ne [IntPtr]::Zero) { [ConHider]::ShowWindow($ch, 0) | Out-Null }
-} catch {}
+  Log-Err 'console hidden'
+} catch { Log-Err ('ConHider: ' + $_.Exception.Message) }
 
-function Log-Err {
-  param($m)
-  try { Add-Content -Path $script:ErrLog -Value ((Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '  ' + $m) } catch {}
+# ---- 原生 API（热键 / 键盘状态 / alpha 硬边 / 品红吸附） ----
+Add-Type -ReferencedAssemblies System.Drawing @'
+using System;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.Runtime.InteropServices;
+public class PetApi {
+  [DllImport("user32.dll")] public static extern bool RegisterHotKey(IntPtr hWnd, int id, uint fsModifiers, uint vk);
+  [DllImport("user32.dll")] public static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+  [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
+  public static void HardenAlpha(Bitmap bmp, byte threshold) {
+    Rectangle rect = new Rectangle(0, 0, bmp.Width, bmp.Height);
+    BitmapData data = bmp.LockBits(rect, ImageLockMode.ReadWrite, PixelFormat.Format32bppArgb);
+    try {
+      int len = data.Stride * data.Height;
+      byte[] buf = new byte[len];
+      Marshal.Copy(data.Scan0, buf, 0, len);
+      for (int i = 3; i < len; i += 4) {
+        byte a = buf[i];
+        if (a > 0 && a < 255) buf[i] = (a >= threshold) ? (byte)255 : (byte)0;
+      }
+      Marshal.Copy(buf, 0, data.Scan0, len);
+    } finally { bmp.UnlockBits(data); }
+  }
+  public static void SnapMagenta(Bitmap bmp) {
+    Rectangle rect = new Rectangle(0, 0, bmp.Width, bmp.Height);
+    BitmapData data = bmp.LockBits(rect, ImageLockMode.ReadWrite, PixelFormat.Format32bppArgb);
+    try {
+      int len = data.Stride * data.Height;
+      byte[] buf = new byte[len];
+      Marshal.Copy(data.Scan0, buf, 0, len);
+      for (int i = 0; i < len; i += 4) {
+        byte b = buf[i], g = buf[i + 1], r = buf[i + 2];
+        if (r > 190 && b > 190 && g < 170) { buf[i] = 255; buf[i + 1] = 0; buf[i + 2] = 255; }
+      }
+      Marshal.Copy(buf, 0, data.Scan0, len);
+    } finally { bmp.UnlockBits(data); }
+  }
 }
+'@
+
+# 子类窗体：OnPaint 直接绘制帧 + 拦截 WM_HOTKEY + 双缓冲
+Add-Type -ReferencedAssemblies System.Windows.Forms,System.Drawing @'
+using System;
+using System.Drawing;
+using System.Windows.Forms;
+public class PetForm : Form {
+  public Action HotKeyPressed;
+  public Action<Graphics> FramePainter;
+  public PetForm() { this.DoubleBuffered = true; }
+  protected override void OnPaint(PaintEventArgs e) {
+    Action<Graphics> p = FramePainter;
+    if (p != null) p(e.Graphics);
+    base.OnPaint(e);
+  }
+  protected override void WndProc(ref Message m) {
+    if (m.Msg == 0x0312) {
+      Action a = HotKeyPressed;
+      if (a != null) a();
+    }
+    base.WndProc(ref m);
+  }
+}
+'@
 
 $script:PetImg = $null
 try {
   $script:PetImg = [System.Drawing.Image]::FromFile($script:ImgPath)
+  Log-Err ('image loaded: ' + $script:ImgPath)
 } catch {
   Log-Err ('image load failed: ' + $_.Exception.Message)
   [System.Windows.Forms.MessageBox]::Show("图片加载失败：$($_.Exception.Message)", 'DS娘桌宠', 'OK', 'Error') | Out-Null
@@ -78,55 +139,61 @@ $script:PHRASES = @(
 )
 
 # ---------- 状态 ----------
-$script:rot          = 0.0
 $script:scale        = 0.30        # 默认宽约 230px（原图 767px）
 $script:minScale     = 0.08
 $script:maxScale     = 2.0
-$script:minimized    = $false
 $script:phrase       = $null
 $script:phraseHideAt = 0
 $script:bal          = $null
 $script:balVisible   = $false
 $script:bobPhase     = 0.0
 $script:dragging     = $false
-$script:dragMode     = 'none'
 $script:dragStartX   = 0
 $script:dragStartY   = 0
 $script:dragStartAnchorX = 0
 $script:dragStartAnchorY = 0
-$script:dragStartRot = 0.0
 $script:dragMoved    = $false
 $script:anchorX      = 0
 $script:anchorY      = 0
 $script:canvas       = $null
 $script:canvasW      = 0
 $script:canvasH      = 0
-$script:margin       = 20.0
-$script:bubbleH      = 58.0
-$script:plusRect     = $null
-$script:minusRect    = $null
+$script:margin       = 16.0
+$script:bubbleH      = 60.0
+$script:bobRange     = 6.0
 $script:scaledImg    = $null
 $script:balPS        = $null
 $script:balHandle    = $null
+$script:hotkeyOk     = $false
+$script:bgQueue      = New-Object System.Collections.Queue
+$script:lastEnqueued = $null
 
 $script:Magenta = [System.Drawing.Color]::Magenta
 
-# ---------- 窗体 ----------
-$form = New-Object System.Windows.Forms.Form
+# ---------- 窗体（颜色键控透明 + OnPaint 绘制） ----------
+$form = New-Object PetForm
 $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
 $form.StartPosition   = [System.Windows.Forms.FormStartPosition]::Manual
 $form.TopMost         = $true
 $form.ShowInTaskbar   = $false
 $form.TransparencyKey = $script:Magenta
 $form.BackColor       = $script:Magenta
-$form.BackgroundImageLayout = [System.Windows.Forms.ImageLayout]::None
 $form.KeyPreview      = $true
 
 $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
 $script:anchorX = $wa.Right - 140
 $script:anchorY = $wa.Bottom - 24
+Log-Err ('form created, screen ' + $wa.Width + 'x' + $wa.Height)
 
-# ---------- 绘图辅助 ----------
+# OnPaint：把当前帧画到窗体上（不再换 BackgroundImage，杜绝闪烁）
+$form.FramePainter = [Action[System.Drawing.Graphics]]{
+  param($gr)
+  try {
+    if ($script:canvas) { $gr.DrawImageUnscaled($script:canvas, 0, 0) }
+  } catch { Log-Err ('Paint: ' + $_.Exception.Message) }
+}
+
+# ---------- 绘图辅助（全部硬边，避免品红混色） ----------
 function New-RoundedPath {
   param([double]$x, [double]$y, [double]$w, [double]$h, [double]$r)
   $p = New-Object System.Drawing.Drawing2D.GraphicsPath
@@ -139,33 +206,27 @@ function New-RoundedPath {
   return $p
 }
 
-function Draw-CircleButton {
-  param($g, [System.Drawing.Rectangle]$rect, [string]$glyph, [System.Drawing.Color]$fill)
+# 测量气泡尺寸：宽度不超过画布，长文本自动换行增高
+function Measure-Bubble {
+  param($mg, [string]$text, [int]$cw)
   try {
-    $brush = New-Object System.Drawing.SolidBrush($fill)
-    $pen   = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 160, 180, 220), 2)
-    $g.FillEllipse($brush, $rect)
-    $g.DrawEllipse($pen, $rect)
-    $font = New-Object System.Drawing.Font('Segoe UI', 13, [System.Drawing.FontStyle]::Bold)
-    $tb   = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(255, 70, 90, 140))
-    $sf   = New-Object System.Drawing.StringFormat
-    $sf.Alignment = [System.Drawing.StringAlignment]::Center
-    $sf.LineAlignment = [System.Drawing.StringAlignment]::Center
-    $g.DrawString($glyph, $font, $tb, [System.Drawing.RectangleF]$rect, $sf)
-    $sf.Dispose(); $tb.Dispose(); $font.Dispose(); $pen.Dispose(); $brush.Dispose()
-  } catch { Log-Err ('Draw-CircleButton: ' + $_.Exception.Message) }
+    $font = New-Object System.Drawing.Font('Microsoft YaHei UI', 11)
+    $wrapW = [Math]::Max(60, [Math]::Min(330, ($cw - 40)))
+    $size = $mg.MeasureString($text, $font, $wrapW)
+    $bw2 = [int][Math]::Ceiling($size.Width) + 26
+    $bhh = [int][Math]::Ceiling($size.Height) + 18
+    $bw2 = [Math]::Max(64, [Math]::Min($bw2, ($cw - 8)))
+    $font.Dispose()
+    return @($bw2, $bhh)
+  } catch { Log-Err ('Measure-Bubble: ' + $_.Exception.Message); return @(120, 40) }
 }
 
 function Draw-Bubble {
-  param($g, [string]$text, [double]$headX, [double]$headY, [bool]$isBal, [int]$cw)
+  param($g, [string]$text, [double]$headX, [double]$headY, [bool]$isBal, [int]$cw, [int]$bw2, [int]$bhh)
   try {
     $font = New-Object System.Drawing.Font('Microsoft YaHei UI', 11)
-    $size = $g.MeasureString($text, $font, 330)
-    $bw2  = [int][Math]::Ceiling($size.Width) + 26
-    $bhh  = [int][Math]::Ceiling($size.Height) + 14
-    $bw2  = [Math]::Max(64, [Math]::Min(360, $bw2))
     $bx   = $headX - $bw2 / 2.0
-    $by   = $headY - 16.0 - $bhh
+    $by   = $headY - 10.0 - $bhh
     $bx   = [Math]::Max(4.0, [Math]::Min(($cw - $bw2 - 4.0), $bx))
     $by   = [Math]::Max(4.0, $by)
     if ($isBal) {
@@ -196,13 +257,13 @@ function Draw-Bubble {
     $g.FillPath($tailBr, $tail)
     $tail.Dispose(); $tailBr.Dispose()
     $fgBr = New-Object System.Drawing.SolidBrush($fg)
-    $rect = New-Object System.Drawing.RectangleF([float]($bx + 13), [float]($by + 7), [float]($bw2 - 26), [float]($bhh - 12))
+    $rect = New-Object System.Drawing.RectangleF([float]($bx + 13), [float]($by + 8), [float]($bw2 - 26), [float]($bhh - 14))
     $g.DrawString($text, $font, $fgBr, $rect)
     $fgBr.Dispose(); $font.Dispose()
   } catch { Log-Err ('Draw-Bubble: ' + $_.Exception.Message) }
 }
 
-# ---------- 缩放缓存 ----------
+# ---------- 缩放缓存（alpha 硬边，杜绝品红混边） ----------
 function Build-Scaled {
   try {
     if ($script:scaledImg) { $script:scaledImg.Dispose() }
@@ -213,109 +274,62 @@ function Build-Scaled {
     $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
     $g.DrawImage($script:PetImg, 0, 0, $w, $h)
     $g.Dispose()
+    [PetApi]::HardenAlpha($bmp, 128)
     $script:scaledImg = $bmp
   } catch { Log-Err ('Build-Scaled: ' + $_.Exception.Message) }
 }
 
-# ---------- 画布复用 ----------
-function EnsureCanvas {
-  param([int]$cw, [int]$ch)
-  if ($script:canvas -and $script:canvasW -eq $cw -and $script:canvasH -eq $ch) { return }
-  $old = $script:canvas
-  $script:canvas = New-Object System.Drawing.Bitmap($cw, $ch)
-  $script:canvasW = $cw
-  $script:canvasH = $ch
-  if ($form.BackgroundImage -eq $old) {
-    $form.BackgroundImage = $script:canvas
-    if ($old) { $old.Dispose() }
-  } elseif ($old) {
-    $old.Dispose()
-  }
-}
-
-# ---------- 渲染 ----------
+# ---------- 渲染（每帧新画布；硬边 + SnapMagenta；无旋转；含浮动；气泡自适应） ----------
 function Render {
   try {
     if (-not $script:scaledImg) { Build-Scaled }
-    if ($script:minimized) {
-      $cw = 118; $ch = 50
-      EnsureCanvas $cw $ch
-      $g = [System.Drawing.Graphics]::FromImage($script:canvas)
-      $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-      $g.Clear($script:Magenta)
-      $script:plusRect  = New-Object System.Drawing.Rectangle(34, 10, 32, 32)
-      $script:minusRect = New-Object System.Drawing.Rectangle(80, 10, 32, 32)
-      Draw-CircleButton $g $script:plusRect  '+' ([System.Drawing.Color]::FromArgb(255, 224, 234, 255))
-      Draw-CircleButton $g $script:minusRect '-' ([System.Drawing.Color]::FromArgb(255, 255, 228, 228))
-      $g.Dispose()
-    } else {
-      $sw = $script:scaledImg.Width
-      $sh = $script:scaledImg.Height
-      $rad = $script:rot * [Math]::PI / 180.0
-      $cosr = [Math]::Cos($rad)
-      $sinr = [Math]::Sin($rad)
-      # 旋转后包围盒（绕脚底中心 origin）
-      $c1x = -$sw / 2.0 * $cosr
-      $c1y = -$sw / 2.0 * $sinr
-      $c2x =  $sw / 2.0 * $cosr
-      $c2y =  $sw / 2.0 * $sinr
-      $c3x = -$sw / 2.0 * $cosr + $sh * $sinr
-      $c3y = -$sw / 2.0 * $sinr - $sh * $cosr
-      $c4x =  $sw / 2.0 * $cosr + $sh * $sinr
-      $c4y =  $sw / 2.0 * $sinr - $sh * $cosr
-      $minX = [Math]::Min([Math]::Min($c1x, $c2x), [Math]::Min($c3x, $c4x))
-      $maxX = [Math]::Max([Math]::Max($c1x, $c2x), [Math]::Max($c3x, $c4x))
-      $minY = [Math]::Min([Math]::Min($c1y, $c2y), [Math]::Min($c3y, $c4y))
-      $maxY = [Math]::Max([Math]::Max($c1y, $c2y), [Math]::Max($c3y, $c4y))
-      $margin  = $script:margin
-      $bubbleH = $script:bubbleH
-      $cw = [int][Math]::Ceiling(($maxX - $minX) + $margin * 2)
-      $ch = [int][Math]::Ceiling(($maxY - $minY) + $margin * 2 + $bubbleH)
-      $cx = $margin - $minX
-      $cy = $margin + $bubbleH - $minY
-      EnsureCanvas $cw $ch
-      $g = [System.Drawing.Graphics]::FromImage($script:canvas)
-      $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
-      $g.Clear($script:Magenta)
-      $bob = 0.0
-      $g.TranslateTransform([float]$cx, [float]($cy + $bob))
-      $g.RotateTransform([float]$script:rot)
-      $g.DrawImage($script:scaledImg, [float](-$sw / 2.0), [float](-$sh), [float]$sw, [float]$sh)
-      $g.ResetTransform()
-      # 头部位置
-      $headX = $cx + $sh * $sinr
-      $headY = ($cy + $bob) - $sh * $cosr
-      # 气泡
-      $text  = $null
-      $isBal = $false
-      if ($script:balVisible -and $script:bal) { $text = $script:bal; $isBal = $true }
-      elseif ($script:phrase)                   { $text = $script:phrase }
-      if ($text) { Draw-Bubble $g $text $headX $headY $isBal $cw }
-      # 右下角「-」按钮
-      $script:plusRect = $null
-      $br = 14
-      $bxc = $cw - 22
-      $byc = $ch - 22
-      $mRect = New-Object System.Drawing.Rectangle(($bxc - $br), ($byc - $br), ($br * 2), ($br * 2))
-      Draw-CircleButton $g $mRect '-' ([System.Drawing.Color]::FromArgb(255, 255, 228, 228))
-      $script:minusRect = $mRect
-      $g.Dispose()
+    $sw = $script:scaledImg.Width
+    $sh = $script:scaledImg.Height
+    $margin  = $script:margin
+    $bob = [Math]::Sin($script:bobPhase) * $script:bobRange
+    $cw = [int][Math]::Ceiling($sw + $margin * 2)
+    # 当前气泡文字
+    $text  = $null
+    $isBal = $false
+    if ($script:balVisible -and $script:bal) { $text = $script:bal; $isBal = $true }
+    elseif ($script:phrase)                   { $text = $script:phrase }
+    # 测量气泡（宽不超画布、长文本换行增高）
+    $bw2 = 0
+    $bhh = 0
+    if ($text) {
+      $measureBmp = New-Object System.Drawing.Bitmap(8, 8)
+      $mg = [System.Drawing.Graphics]::FromImage($measureBmp)
+      $dims = Measure-Bubble $mg $text $cw
+      $mg.Dispose()
+      $measureBmp.Dispose()
+      $bw2 = $dims[0]
+      $bhh = $dims[1]
     }
+    # 头部位置（气泡下方 + 浮动余量），画布高度随气泡自适应
+    $headY = $margin + $bhh + $script:bobRange + 10
+    $ch = [int][Math]::Ceiling($headY + $sh + $margin + $script:bobRange)
+    $bmp = New-Object System.Drawing.Bitmap($cw, $ch)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::None
+    $g.Clear($script:Magenta)
+    $g.DrawImage($script:scaledImg, [float]$margin, [float]($headY + $bob), [float]$sw, [float]$sh)
+    $headX = $margin + $sw / 2.0
+    if ($text) { Draw-Bubble $g $text $headX ($headY + $bob) $isBal $cw $bw2 $bhh }
+    $g.Dispose()
+    [PetApi]::SnapMagenta($bmp)
+    $script:canvas = $bmp
+    $script:canvasW = $cw
+    $script:canvasH = $ch
   } catch { Log-Err ('Render: ' + $_.Exception.Message) }
 }
 
-# ---------- 定位 + 重绘 ----------
+# ---------- 定位 + 帧入队（OnPaint 读取当前帧，无需换 BackgroundImage） ----------
 function Apply {
   try {
     $cw = $script:canvasW
     $ch = $script:canvasH
     $newX = [int]($script:anchorX - $cw / 2.0)
-    if ($script:minimized) {
-      $newY = [int]($script:anchorY - $ch)
-    } else {
-      $newY = [int]($script:anchorY - ($ch - $script:margin))
-    }
-    # 保持在屏幕内
+    $newY = [int]($script:anchorY - ($ch - $script:margin - $script:bobRange))
     $newX = [Math]::Max($wa.Left, [Math]::Min(($wa.Right - $cw), $newX))
     $newY = [Math]::Max($wa.Top, [Math]::Min(($wa.Bottom - $ch), $newY))
     if ($form.Location.X -ne $newX -or $form.Location.Y -ne $newY) {
@@ -323,6 +337,14 @@ function Apply {
     }
     if ($form.Size.Width -ne $cw -or $form.Size.Height -ne $ch) {
       $form.Size = New-Object System.Drawing.Size($cw, $ch)
+    }
+    if ($script:canvas -and $script:canvas -ne $script:lastEnqueued) {
+      $script:bgQueue.Enqueue($script:canvas)
+      $script:lastEnqueued = $script:canvas
+      while ($script:bgQueue.Count -gt 2) {
+        $old = $script:bgQueue.Dequeue()
+        try { $old.Dispose() } catch {}
+      }
     }
     $form.Invalidate()
   } catch { Log-Err ('Apply: ' + $_.Exception.Message) }
@@ -374,71 +396,47 @@ function Start-BalanceFetch {
 
 # ---------- 鼠标 ----------
 $form.Add_MouseDown({
+  param($s, $e)
   try {
-    $p = New-Object System.Drawing.Point($e.X, $e.Y)
-    if ($script:minusRect -and $script:minusRect.Contains($p)) {
-      if ($script:minimized) {
-        $form.Close()
-      } else {
-        $script:minimized = $true
-        Render
-        Apply
-      }
-      return
-    }
-    if ($script:plusRect -and $script:plusRect.Contains($p)) {
-      $script:minimized = $false
-      Render
-      Apply
-      return
-    }
+    if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Right) { return }
+    $form.Activate()
     $script:dragging = $true
     $script:dragMoved = $false
     $script:dragStartX = $e.X
     $script:dragStartY = $e.Y
     $script:dragStartAnchorX = $script:anchorX
     $script:dragStartAnchorY = $script:anchorY
-    $script:dragStartRot = $script:rot
-    if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Right) {
-      $script:dragMode = 'rotate'
-    } else {
-      $script:dragMode = 'move'
-    }
     $form.Capture = $true
   } catch { Log-Err ('MouseDown: ' + $_.Exception.Message) }
 })
 
 $form.Add_MouseMove({
+  param($s, $e)
   try {
     if (-not $script:dragging) { return }
     $dx = $e.X - $script:dragStartX
     $dy = $e.Y - $script:dragStartY
     if ([Math]::Abs($dx) + [Math]::Abs($dy) -gt 4) { $script:dragMoved = $true }
-    if ($script:dragMode -eq 'move') {
-      $script:anchorX = $script:dragStartAnchorX + $dx
-      $script:anchorY = $script:dragStartAnchorY + $dy
-      Apply
-    } else {
-      $ox = $script:canvasW / 2.0
-      $oy = $script:canvasH - $script:margin
-      $a0 = [Math]::Atan2($script:dragStartY - $oy, $script:dragStartX - $ox)
-      $a1 = [Math]::Atan2($e.Y - $oy, $e.X - $ox)
-      $script:rot = $script:dragStartRot + ($a1 - $a0) * 180.0 / [Math]::PI
-      Render
-      Apply
-    }
+    $script:anchorX = $script:dragStartAnchorX + $dx
+    $script:anchorY = $script:dragStartAnchorY + $dy
+    Apply
   } catch { Log-Err ('MouseMove: ' + $_.Exception.Message) }
 })
 
 $form.Add_MouseUp({
+  param($s, $e)
   try {
+    $btn = $e.Button
+    if ($btn -eq [System.Windows.Forms.MouseButtons]::Right) {
+      # 右键单击关闭桌宠
+      $form.Close()
+      return
+    }
     if (-not $script:dragging) { return }
     $moved = $script:dragMoved
-    $mode  = $script:dragMode
-    $btn   = $e.Button
     $script:dragging = $false
     $form.Capture = $false
-    if ($mode -eq 'move' -and -not $moved -and $btn -eq [System.Windows.Forms.MouseButtons]::Left) {
+    if (-not $moved) {
       $script:phrase = $script:PHRASES | Get-Random
       $script:phraseHideAt = [Environment]::TickCount + 3600
       Render
@@ -448,7 +446,10 @@ $form.Add_MouseUp({
 })
 
 $form.Add_MouseWheel({
+  param($s, $e)
   try {
+    Log-Err ('wheel delta=' + $e.Delta + ' oldScale=' + $script:scale)
+    # 标准映射：Delta>0（向前滚/远离自己）→ 放大；Delta<0（向后滚）→ 缩小
     $factor = 1.12
     if ($e.Delta -lt 0) { $factor = 0.89 }
     $script:scale = [Math]::Max($script:minScale, [Math]::Min($script:maxScale, $script:scale * $factor))
@@ -459,9 +460,9 @@ $form.Add_MouseWheel({
 })
 
 $form.Add_MouseDoubleClick({
+  param($s, $e)
   try {
-    if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left -and -not $script:minimized) {
-      $script:rot = 0.0
+    if ($e.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
       $script:scale = 0.30
       Build-Scaled
       Render
@@ -470,37 +471,17 @@ $form.Add_MouseDoubleClick({
   } catch { Log-Err ('DoubleClick: ' + $_.Exception.Message) }
 })
 
-$form.Add_KeyDown({
-  try {
-    if ($e.KeyCode -eq [System.Windows.Forms.Keys]::F8 -and -not $e.Repeat) {
-      $script:balVisible = $true
-      if (-not $script:balPS) { Start-BalanceFetch }
-      Render
-      Apply
-    }
-  } catch { Log-Err ('KeyDown: ' + $_.Exception.Message) }
-})
-
-$form.Add_KeyUp({
-  try {
-    if ($e.KeyCode -eq [System.Windows.Forms.Keys]::F8) {
-      $script:balVisible = $false
-      Render
-      Apply
-    }
-  } catch { Log-Err ('KeyUp: ' + $_.Exception.Message) }
-})
-
-# ---------- 定时器（只做轻量逻辑，不重绘；仅在状态变化时重绘） ----------
+# ---------- 定时器（浮动动画 + 轻量逻辑 + F8 松开检测） ----------
 $timer = New-Object System.Windows.Forms.Timer
-$timer.Interval = 200
+$timer.Interval = 80
 $timer.Add_Tick({
   try {
-    $changed = $false
-    $now = [Environment]::TickCount
-    if ($script:phrase -and $now -gt $script:phraseHideAt) {
+    $script:bobPhase += 0.13
+    if ($script:phrase -and ([Environment]::TickCount -gt $script:phraseHideAt)) {
       $script:phrase = $null
-      $changed = $true
+    }
+    if ($script:balVisible -and (([PetApi]::GetAsyncKeyState(0x77) -band 0x8000) -eq 0)) {
+      $script:balVisible = $false
     }
     if ($script:balHandle) {
       if ($script:balHandle.IsCompleted) {
@@ -513,32 +494,49 @@ $timer.Add_Tick({
         $script:balPS.Dispose()
         $script:balPS = $null
         $script:balHandle = $null
-        $changed = $true
       }
     }
-    if ($changed) {
-      Render
-      Apply
-    }
+    Render
+    Apply
   } catch { Log-Err ('Timer: ' + $_.Exception.Message) }
 })
 $timer.Start()
 
+# ---------- 全局 F8 热键 ----------
+$form.HotKeyPressed = [System.Action]{
+  try {
+    if (-not $script:balPS) { Start-BalanceFetch }
+    $script:balVisible = $true
+    Render
+    Apply
+  } catch { Log-Err ('HotKey: ' + $_.Exception.Message) }
+}
+try {
+  $null = $form.Handle
+  $script:hotkeyOk = [PetApi]::RegisterHotKey($form.Handle, 1, 0x4000, 0x77)
+  Log-Err ('RegisterHotKey F8 -> ' + $script:hotkeyOk)
+} catch { Log-Err ('RegisterHotKey: ' + $_.Exception.Message) }
+
 # ---------- 启动 ----------
-Build-Scaled
-Render
-$form.BackgroundImage = $script:canvas
-Apply
-$script:phrase = '点我说话~ 右键转圈圈，滚轮缩放，按住 F8 看余额哦！'
-$script:phraseHideAt = [Environment]::TickCount + 6500
-$form.Activate()
-[System.Windows.Forms.Application]::Run($form)
+try {
+  Build-Scaled
+  Log-Err ('scaled: ' + $script:scaledImg.Width + 'x' + $script:scaledImg.Height)
+  $script:phrase = '点我说话~ 滚轮缩放，按住 F8 看余额，右键关闭我哦！'
+  $script:phraseHideAt = [Environment]::TickCount + 6500
+  Render
+  Log-Err ('rendered canvas: ' + $script:canvasW + 'x' + $script:canvasH)
+  Apply
+  Log-Err 'initial Apply done'
+  [System.Windows.Forms.Application]::Run($form)
+  Log-Err 'Run exited (pet closed)'
+} catch { Log-Err ('Startup: ' + $_.Exception.Message) }
 
 # ---------- 清理 ----------
 $timer.Stop()
 $timer.Dispose()
+try { if ($script:hotkeyOk) { [PetApi]::UnregisterHotKey($form.Handle, 1) | Out-Null } } catch {}
 if ($script:balPS) { $script:balPS.Dispose() }
 if ($script:scaledImg) { $script:scaledImg.Dispose() }
+while ($script:bgQueue.Count -gt 0) { $old = $script:bgQueue.Dequeue(); try { $old.Dispose() } catch {} }
 if ($script:canvas) { $script:canvas.Dispose() }
 if ($script:PetImg) { $script:PetImg.Dispose() }
-if ($script:Mutex) { try { $script:Mutex.ReleaseMutex() } catch {} }
